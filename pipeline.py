@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -96,17 +97,17 @@ def metrics(g: nx.DiGraph, nodes: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFram
     df["pass_through"] = np.where(df.sum_in > 0, df.sum_out / df.sum_in, np.nan)
     df.loc[df.is_courier, "pass_through"] = np.nan
     df["is_cutoff"] = (df.depth == 4) & (df.out_receivers == 0)
-    # Upstream distinct couriers; if the source data has no courier flag, this stays zero.
+    # Reachability in the observed directed graph, excluding the node itself.
     courier_by_gid = dict(zip(df.gid, df.is_courier))
     upstream = {}
     for n in g:
-        seen, stack = set(), list(g.predecessors(n))
+        seen, stack = {n}, list(g.predecessors(n))
         while stack:
             p = stack.pop()
             if p in seen: continue
             seen.add(p)
             stack.extend(g.predecessors(p))
-        upstream[n] = sum(courier_by_gid.get(p, False) for p in seen)
+        upstream[n] = sum(courier_by_gid.get(p, False) for p in seen if p != n)
     df["upstream_couriers"] = df.gid.map(upstream).fillna(0).astype(int)
     # Optional temporal signal from transactions: median days from an
     # observed incoming transfer to the next observed outgoing transfer.
@@ -132,32 +133,50 @@ def classify(df: pd.DataFrame) -> pd.DataFrame:
     def one(r):
         if r.out_receivers >= 20: return "distributor", min(r.out_receivers / 60.0, 1.0), f"{r.out_receivers} получателей"
         if r.in_senders >= 8: return "consolidator", min(r.in_senders / 24.0, 1.0), f"{r.in_senders} отправителей"
-        if r.upstream_couriers >= 3: return "coordinator", min(r.upstream_couriers / 6.0, 1.0), f"{r.upstream_couriers} курьеров выше по цепочке"
+        if r.upstream_couriers >= 3 and r.in_senders >= 2: return "coordinator", min(r.upstream_couriers / 6.0, 1.0), f"{r.upstream_couriers} курьеров выше по цепочке"
         if pd.notna(r.pass_through) and 0.8 <= r.pass_through <= 1.2 and r.in_senders + r.out_receivers <= 8:
             return "transit", min(1.0, 1.0 - abs(1.0 - r.pass_through) / .2), f"пропуск {r.pass_through:.2f}, связей {r.in_senders + r.out_receivers}"
-        if r.sum_in > 0 and r.sum_out <= r.sum_in * .1 and not r.is_cutoff:
+        if r.sum_in > 0 and r.sum_out <= r.sum_in * .1 and not r.is_cutoff and not r.is_courier and not r.is_seed:
             return "terminal", min(1.0, r.sum_in / max(df.sum_in.quantile(.9), 1)), f"вход {r.sum_in:,.0f}, выход {r.sum_out:,.0f}"
         return "peripheral", .2, f"{r.in_senders} отправителей, {r.out_receivers} получателей"
     values = df.apply(one, axis=1, result_type="expand")
     df[["role", "role_score", "evidence"]] = values
+    def explain(r):
+        facts = f"Вход {r.sum_in:,.0f} KZT от {r.in_senders}; выход {r.sum_out:,.0f} KZT к {r.out_receivers}. "
+        reasons = {
+            "distributor": f"Веер: {r.out_receivers} получателей при пороге 20.",
+            "consolidator": f"Признаки консолидации: {r.in_senders} отправителей при пороге 8.",
+            "coordinator": f"Слияние: {r.upstream_couriers} курьеров-предков (порог 3), {r.in_senders} входящих ветвей.",
+            "transit": f"Пропуск {r.pass_through:.2f} в диапазоне 0.8–1.2; связей ≤8.",
+            "terminal": "Ушло ≤10%; не обрыв. Возможное накопление только в наблюдаемой выборке.",
+            "peripheral": "Порогов структурных ролей не достиг; данных недостаточно.",
+        }
+        caveat = " Обрыв на глубине 4." if r.is_cutoff else " Seed: пропуск не используется." if r.is_seed else ""
+        return (facts + reasons[r.role] + caveat)[:200]
+    df["evidence"] = df.apply(explain, axis=1)
     df["evidence"] = df.evidence.str.slice(0, 200)
     return df
 
 
 def clusters(g: nx.DiGraph, df: pd.DataFrame):
-    ug = g.to_undirected()
+    ug = nx.Graph()
+    ug.add_nodes_from(sorted(g.nodes))
+    for u, v, attrs in sorted(g.edges(data=True)):
+        weight = ug.get_edge_data(u, v, {}).get("sum_kzt", 0)
+        ug.add_edge(u, v, sum_kzt=weight + attrs["sum_kzt"])
     communities = list(nx.community.louvain_communities(ug, weight="sum_kzt", seed=42)) if ug else []
     cid = {gid: i for i, group in enumerate(communities) for gid in group}
     df["cluster_id"] = df.gid.map(cid).fillna(-1).astype(int)
     rows = []
     for i, group in enumerate(communities):
         roles = df[df.gid.isin(group)].role.value_counts(normalize=True)
+        role_counts = {str(k): int(v) for k, v in df[df.gid.isin(group)].role.value_counts().items()}
         dominant = roles.index[0] if len(roles) else "peripheral"
         composition = ", ".join(f"{role} {share:.0%}" for role, share in roles.head(3).items())
         hyp = f"Кластер по составу ролей: {composition}; гипотеза — преобладает {dominant}"
         internal = sum(g[u][v].get("sum_kzt", 0) for u, v in g.edges if u in group and v in group)
         top = df[df.gid.isin(group)].sort_values("priority_score", ascending=False).gid.head(10).tolist()
-        rows.append({"cluster_id": i, "n_nodes": len(group), "n_seed": int(df[df.gid.isin(group)].is_seed.sum()), "sum_kzt_internal": internal, "top_gids": ",".join(map(str, top)), "hypothesis": hyp})
+        rows.append({"cluster_id": i, "n_nodes": len(group), "n_seed": int(df[df.gid.isin(group)].is_seed.sum()), "sum_kzt_internal": internal, "top_gids": ",".join(map(str, top)), "hypothesis": hyp, "role_counts": role_counts})
     return pd.DataFrame(rows)
 
 
@@ -182,7 +201,16 @@ def make_outputs(g, df, edges, out_dir: Path):
     node_json = [{"id": int(row["gid"]), **{k: (None if pd.isna(v) else (v.item() if hasattr(v, "item") else v)) for k, v in row.items()}} for row in df[roles_cols].to_dict("records")]
     cluster_json = [{k: (v.item() if hasattr(v, "item") else v) for k, v in row.items()} for row in clusters_df.to_dict("records")]
     top_json = [{"rank": i + 1, "gid": int(r.gid), "role": r.role, "priority_score": float(r.priority_score), "why": r.evidence} for i, r in enumerate(top.itertuples())]
-    (out_dir / "graph.json").write_text(json.dumps({"nodes": node_json, "links": links, "clusters": cluster_json, "top": top_json}, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = {"nodes": node_json, "links": links, "clusters": cluster_json, "top": top_json}
+    for cluster in cluster_json:
+        actual = df[df.cluster_id == cluster["cluster_id"]].role.value_counts().to_dict()
+        if actual != cluster["role_counts"]:
+            raise ValueError("Cluster/node role mismatch")
+    version = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+    payload["meta"] = {"build_id": version, "role_counts": df.role.value_counts().to_dict(), "schema_version": 2}
+    temporary = out_dir / "graph.json.tmp"
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    temporary.replace(out_dir / "graph.json")
     return df
 
 

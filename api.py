@@ -1,18 +1,22 @@
 """FastAPI service for the generated graph. Run: uvicorn api:app --reload."""
 from __future__ import annotations
-import json, os, re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import json, os, re, asyncio, logging, hashlib
 from pathlib import Path
 from typing import Any
 import networkx as nx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-OUT = Path(os.getenv("GRAPH_OUT", "out"))
-FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", "frontend/dist"))
+BASE = Path(__file__).resolve().parent
+OUT = Path(os.getenv("GRAPH_OUT", str(BASE / "out")))
+FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", str(BASE / "frontend/dist")))
 app = FastAPI(title="Money Graph API")
+app.add_middleware(CORSMiddleware,
+    allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:4174,http://127.0.0.1:4174").split(",") if x.strip()],
+    allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
 def graph_data():
     p = OUT / "graph.json"
@@ -26,7 +30,16 @@ def graph():
     return d, g
 
 @app.get("/api/graph")
-def get_graph(): return graph_data()
+def get_graph():
+    data = graph_data()
+    version = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+    return JSONResponse(data, headers={"Cache-Control": "no-store", "X-Graph-Version": version})
+
+@app.get("/api/health")
+def health():
+    return {"llm_configured": bool(os.getenv("OPENAI_API_KEY")),
+            "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "graph_ready": (OUT / "graph.json").exists()}
 
 @app.get("/api/node/{gid}")
 def get_node(gid: int):
@@ -38,6 +51,7 @@ def get_node(gid: int):
 def tool(name: str, args: dict[str, Any]):
     d, g = graph(); nodes = {int(n.get("gid", n.get("id"))): n for n in d["nodes"]}
     gid = int(args.get("gid", 0))
+    if name == "graph_top": return d["top"][:10]
     if name == "get_node": return get_node(gid)
     if name == "get_senders": return [nodes[x] for x in g.predecessors(gid)]
     if name == "get_receivers": return [nodes[x] for x in g.successors(gid)]
@@ -45,7 +59,7 @@ def tool(name: str, args: dict[str, Any]):
         ids = [int(x) for x in args.get("gids", [])]; sets = [set(g.successors(x)) for x in ids]
         return [nodes[x] for x in (set.intersection(*sets) if sets else set())]
     if name == "trace_downstream":
-        depth = int(args.get("depth", 3)); seen = {gid}; frontier = {gid}
+        depth = max(0, min(4, int(args.get("depth", 3)))); seen = {gid}; frontier = {gid}
         for _ in range(depth):
             frontier = set().union(*(set(g.successors(x)) for x in frontier)) - seen; seen |= frontier
         return [nodes[x] for x in seen if x != gid]
@@ -67,10 +81,13 @@ def collect_gids(value: Any) -> set[int]:
             found.update(collect_gids(item))
     return found
 
-class Ask(BaseModel): question: str
+class Ask(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    selected_gids: list[int] = Field(default_factory=list, max_length=100)
 class Resilience(BaseModel): remove: list[int] = []
 
 FUNCTIONS = [
+    {"type": "function", "function": {"name": "graph_top", "description": "Top priority nodes with evidence", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_node", "description": "Return a node and its direct payments", "parameters": {"type": "object", "properties": {"gid": {"type": "integer"}}, "required": ["gid"]}}},
     {"type": "function", "function": {"name": "get_senders", "description": "Return direct senders", "parameters": {"type": "object", "properties": {"gid": {"type": "integer"}}, "required": ["gid"]}}},
     {"type": "function", "function": {"name": "get_receivers", "description": "Return direct receivers", "parameters": {"type": "object", "properties": {"gid": {"type": "integer"}}, "required": ["gid"]}}},
@@ -83,81 +100,97 @@ SYSTEM = ("Отвечай только по данным, полученным �
           "Формулируй выводы как гипотезы и признаки, а не обвинения. "
           "В финальном ответе перечисли все затронутые gid.")
 
-def model_answer(question: str):
-    """Run up to six OpenAI tool-calling turns; return None when unavailable."""
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=key, timeout=20.0, max_retries=0)
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
-        steps, touched = [], set()
-        for _ in range(6):
-            response = client.chat.completions.create(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), messages=messages, tools=FUNCTIONS, tool_choice="auto", temperature=0)
+def selected_nodes(question, selected_gids):
+    known = {int(n.get("gid", n.get("id"))) for n in graph_data()["nodes"]}
+    explicit = list(dict.fromkeys(selected_gids))
+    unknown = sorted(set(explicit) - known)
+    if unknown:
+        raise HTTPException(422, {"unknown_gids": unknown})
+    return list(dict.fromkeys(explicit + [int(x) for x in re.findall(r"\b\d+\b", question) if int(x) in known]))
+
+
+def raw_answer(steps, touched, reason):
+    rows = []
+    for step in steps:
+        result = step["result"]
+        if isinstance(result, dict) and "hypothesis" in result:
+            rows.append(result["hypothesis"])
+        items = result if isinstance(result, list) else [result]
+        for item in items[:10]:
+            if isinstance(item, dict) and ("gid" in item or "id" in item):
+                rows.append(f"gid {item.get('gid', item.get('id'))}: {item.get('evidence', item.get('why', ''))}")
+    return {"answer": "Локальный анализ (LLM недоступна). Гипотезы для проверки. " +
+            ("; ".join(rows) if rows else "По заданным условиям совпадений не найдено."),
+            "steps": list(steps), "highlight_gids": sorted(touched),
+            "mode": "fallback", "llm_error": reason}
+
+
+def fallback_answer(question: str, gids=None, reason="not_configured"):
+    gids = selected_nodes(question, gids or [])
+    q = question.lower()
+    if len(gids) >= 2:
+        name, args = "common_receivers", {"gids": gids}
+    elif gids:
+        name = ("get_senders" if any(x in q for x in ("отправител", "кто плат", "senders"))
+                else "trace_downstream" if any(x in q for x in ("цепоч", "дальше", "downstream"))
+                else "get_receivers" if any(x in q for x in ("получател", "кому", "receivers"))
+                else "get_node")
+        args = {"gid": gids[0]}
+    else:
+        match = re.search(r"(?:кластер|cluster)\s*(\d+)", q)
+        name, args = ("cluster_summary", {"cluster_id": int(match[1])}) if match else ("graph_top", {})
+    result = tool(name, args)
+    return raw_answer([{"tool": name, "args": args, "result": result}],
+                      set(gids) | collect_gids(result), reason)
+
+
+async def model_answer(question, gids, steps, touched):
+    from openai import AsyncOpenAI
+    async with AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=20.0, max_retries=0) as client:
+        messages = [{"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": question + "\nselected_gids: " + json.dumps(gids)}]
+        for turn in range(6):
+            response = await client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=messages, tools=FUNCTIONS, parallel_tool_calls=False,
+                tool_choice="required" if not steps else "none" if turn == 5 else "auto")
             msg = response.choices[0].message
             if not msg.tool_calls:
-                return {"answer": msg.content or "Недостаточно данных.", "steps": steps, "highlight_gids": sorted(touched)}
-            messages.append(msg.model_dump() if hasattr(msg, "model_dump") else msg)
+                if not steps:
+                    raise ValueError("ungrounded_answer")
+                return {"answer": msg.content or "Недостаточно данных.", "steps": steps,
+                        "highlight_gids": sorted(touched), "mode": "llm", "llm_error": None}
+            messages.append(msg.model_dump(exclude_none=True))
             for call in msg.tool_calls:
+                if len(steps) >= 5:
+                    raise ValueError("tool_limit")
                 args = json.loads(call.function.arguments or "{}")
-                if "gid" in args: touched.add(int(args["gid"]))
-                touched.update(int(x) for x in args.get("gids", []))
-                result = tool(call.function.name, args)
+                try:
+                    result = tool(call.function.name, args)
+                except (KeyError, ValueError, nx.NetworkXError, HTTPException):
+                    result = {"error": "Invalid tool arguments or unknown node"}
                 steps.append({"tool": call.function.name, "args": args, "result": result})
                 touched.update(collect_gids(result))
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, ensure_ascii=False, default=str)})
-        return {"answer": "Лимит анализа достигнут; смотрите результаты инструментов.", "steps": steps, "highlight_gids": sorted(touched)}
-    except Exception:
-        return None
+                touched.update(collect_gids(args))
+                touched.update(int(x) for x in args.get("gids", []))
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": json.dumps(result, ensure_ascii=False, default=str)})
+        raise ValueError("step_limit")
+
 
 @app.post("/api/ask")
-def ask(req: Ask):
-    # A five/six-step model loop is attempted with an execution timeout.
-    pool = ThreadPoolExecutor(max_workers=1)
-    try:
-        result = pool.submit(model_answer, req.question).result(timeout=25)
-        if result is not None:
-            return result
-    except (TimeoutError, Exception):
-        result = None
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-    # Deterministic fallback keeps the demo usable without a key or when the model is down.
-    return fallback_answer(req.question)
-    d, _ = graph(); q = req.question.lower(); gids = [int(n.get("gid", n.get("id"))) for n in d["nodes"] if str(n.get("gid", n.get("id"))) in q]
-    touched = gids[:1]; steps = []
-    if touched:
-        result = tool("get_node", {"gid": touched[0]}); steps.append({"tool": "get_node", "result": result})
-        answer = f"Гипотеза по gid {touched[0]}: роль {result.get('role')}, признаки: {result.get('evidence')}."
-    else: answer = "Укажите gid в вопросе; ответ строится по данным графа."
-    return {"answer": answer, "steps": steps[:6], "highlight_gids": touched}
-
-def fallback_answer(question: str):
-    """Return useful raw tool output when the LLM is unavailable."""
-    d, _ = graph()
-    known = {int(n.get("gid", n.get("id"))) for n in d["nodes"]}
-    gids = [int(x) for x in re.findall(r"\d{6,}", question) if int(x) in known]
-    gids = list(dict.fromkeys(gids))
+async def ask(req: Ask):
+    gids = selected_nodes(req.question, req.selected_gids)
+    if not os.getenv("OPENAI_API_KEY"):
+        return fallback_answer(req.question, gids)
     steps, touched = [], set(gids)
-    if len(gids) >= 2:
-        args = {"gids": gids}
-        result = tool("common_receivers", args)
-        steps.append({"tool": "common_receivers", "args": args, "result": result})
-        touched.update(collect_gids(result))
-        answer = "\u0413\u0438\u043f\u043e\u0442\u0435\u0437\u0430: \u043e\u0431\u0449\u0438\u0435 \u043f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0438 \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0435\u043d\u044b common_receivers; \u043d\u0443\u0436\u043d\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0430\u043d\u0430\u043b\u0438\u0442\u0438\u043a\u043e\u043c."
-    elif gids:
-        args = {"gid": gids[0]}
-        result = tool("get_node", args)
-        steps.append({"tool": "get_node", "args": args, "result": result})
-        touched.update(collect_gids(result))
-        answer = f"\u0413\u0438\u043f\u043e\u0442\u0435\u0437\u0430 \u043f\u043e gid {gids[0]}: \u0440\u043e\u043b\u044c {result.get('role')}, \u043f\u0440\u0438\u0437\u043d\u0430\u043a\u0438: {result.get('evidence')}."
-    else:
-        result = d.get("top", [])[:10]
-        steps.append({"tool": "graph_top", "result": result})
-        touched.update(collect_gids(result))
-        answer = "\u041c\u043e\u0434\u0435\u043b\u044c \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430; \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0451\u043d \u0441\u044b\u0440\u043e\u0439 top \u0438\u0437 graph.json."
-    return {"answer": answer, "steps": steps[:6], "highlight_gids": sorted(touched)}
+    try:
+        return await asyncio.wait_for(model_answer(req.question, gids, steps, touched), timeout=25)
+    except Exception as exc:
+        # Never return SDK exception text: it can contain sensitive request details.
+        reason = type(exc).__name__
+        logging.getLogger(__name__).warning("LLM request failed: %s", reason)
+        return raw_answer(steps, touched, reason) if steps else fallback_answer(req.question, gids, reason)
 
 
 @app.post("/api/resilience")
