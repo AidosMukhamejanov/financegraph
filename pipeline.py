@@ -15,6 +15,14 @@ import numpy as np
 import pandas as pd
 
 ROLES = ["consolidator", "transit", "distributor", "coordinator", "terminal", "peripheral"]
+ROLE_WEIGHTS = {
+    "coordinator": 1.00,
+    "consolidator": 0.90,
+    "distributor": 0.80,
+    "transit": 0.65,
+    "terminal": 0.55,
+    "peripheral": 0.10,
+}
 
 
 def load(data_dir: Path):
@@ -54,7 +62,11 @@ def _courier_mask(nodes: pd.DataFrame) -> pd.Series:
         c = _col(nodes, [name])
         if c:
             return nodes[c].fillna(False).astype(bool)
-    return pd.Series(False, index=nodes.index)
+    # The supplied case has no courier column: its 81 seed clients are the
+    # known upstream couriers. This keeps the seed incoming-flow caveat out of
+    # pass-through and makes upstream courier counts meaningful.
+    seed = _col(nodes, ["is_seed", "seed"])
+    return nodes[seed].fillna(False).astype(bool) if seed else pd.Series(False, index=nodes.index)
 
 
 def metrics(g: nx.DiGraph, nodes: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFrame:
@@ -96,6 +108,23 @@ def metrics(g: nx.DiGraph, nodes: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFram
             stack.extend(g.predecessors(p))
         upstream[n] = sum(courier_by_gid.get(p, False) for p in seen)
     df["upstream_couriers"] = df.gid.map(upstream).fillna(0).astype(int)
+    # Optional temporal signal from transactions: median days from an
+    # observed incoming transfer to the next observed outgoing transfer.
+    handoff = {}
+    if not tx.empty and {"src", "dst", "date"}.issubset(tx.columns):
+        dated = tx.assign(date=pd.to_datetime(tx["date"]))
+        incoming = dated.groupby("dst")["date"].apply(list).to_dict()
+        outgoing = dated.groupby("src")["date"].apply(list).to_dict()
+        for gid, dates in incoming.items():
+            next_out = sorted(outgoing.get(gid, []))
+            delays = []
+            for received in dates:
+                later = next((sent for sent in next_out if sent >= received), None)
+                if later is not None:
+                    delays.append((later - received).days)
+            if delays:
+                handoff[gid] = float(np.median(delays))
+    df["handoff_days_median"] = df.gid.map(handoff).astype(float)
     return df
 
 
@@ -122,9 +151,10 @@ def clusters(g: nx.DiGraph, df: pd.DataFrame):
     df["cluster_id"] = df.gid.map(cid).fillna(-1).astype(int)
     rows = []
     for i, group in enumerate(communities):
-        roles = df[df.gid.isin(group)].role.value_counts()
+        roles = df[df.gid.isin(group)].role.value_counts(normalize=True)
         dominant = roles.index[0] if len(roles) else "peripheral"
-        hyp = f"Кластер с преобладанием роли {dominant}; гипотеза по структуре связей"
+        composition = ", ".join(f"{role} {share:.0%}" for role, share in roles.head(3).items())
+        hyp = f"Кластер по составу ролей: {composition}; гипотеза — преобладает {dominant}"
         internal = sum(g[u][v].get("sum_kzt", 0) for u, v in g.edges if u in group and v in group)
         top = df[df.gid.isin(group)].sort_values("priority_score", ascending=False).gid.head(10).tolist()
         rows.append({"cluster_id": i, "n_nodes": len(group), "n_seed": int(df[df.gid.isin(group)].is_seed.sum()), "sum_kzt_internal": internal, "top_gids": ",".join(map(str, top)), "hypothesis": hyp})
@@ -134,7 +164,8 @@ def clusters(g: nx.DiGraph, df: pd.DataFrame):
 def make_outputs(g, df, edges, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     turnover = df.sum_in + df.sum_out
-    df["priority_score"] = .35 * _minmax(df.role_score) + .30 * _minmax(turnover) + .15 * _minmax(df.in_senders) + .20 * _minmax(df.upstream_couriers)
+    df["role_weight"] = df.role.map(ROLE_WEIGHTS).fillna(0.0)
+    df["priority_score"] = .35 * df["role_weight"] + .30 * _minmax(turnover) + .15 * _minmax(df.in_senders) + .20 * _minmax(df.upstream_couriers)
     clusters_df = clusters(g, df)
     # Keep the starter names as aliases so existing jury checks and dashboards continue to work.
     df["in_deg"] = df["in_senders"]
@@ -142,7 +173,7 @@ def make_outputs(g, df, edges, out_dir: Path):
     df["in_kzt"] = df["sum_in"]
     df["out_kzt"] = df["sum_out"]
     df["truncated_by_depth"] = df["is_cutoff"]
-    roles_cols = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence", "in_senders", "out_receivers", "sum_in", "sum_out", "in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx", "pagerank", "pass_through", "depth", "is_seed", "is_cutoff", "truncated_by_depth", "upstream_couriers"]
+    roles_cols = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence", "in_senders", "out_receivers", "sum_in", "sum_out", "in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx", "pagerank", "pass_through", "depth", "is_seed", "is_cutoff", "truncated_by_depth", "upstream_couriers", "handoff_days_median"]
     df[roles_cols].to_csv(out_dir / "nodes_roles.csv", index=False)
     clusters_df.to_csv(out_dir / "clusters.csv", index=False)
     top = df.sort_values("priority_score", ascending=False).head(max(20, min(100, len(df))))
