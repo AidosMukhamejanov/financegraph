@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Money Graph</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:1100px;margin:32px auto;padding:0 18px;color:#172033;background:#f6f8fb}
+    main{background:white;border:1px solid #dce3ee;border-radius:12px;padding:24px;box-shadow:0 4px 18px #17203312}
+    input,button{font:inherit;padding:9px 12px;border:1px solid #bdc8d8;border-radius:7px} button{cursor:pointer;background:#1e5eff;color:white;border:0}
+    pre{white-space:pre-wrap;background:#f1f4f8;padding:14px;border-radius:8px;max-height:560px;overflow:auto}
+    .stats{display:flex;gap:18px;flex-wrap:wrap;margin:18px 0}.stat{padding:12px 16px;background:#eef3ff;border-radius:8px}
+  </style>
+</head>
+<body><main>
+  <h1>Граф денежных потоков</h1>
+  <div class="stats" id="stats">Загрузка графа...</div>
+  <p><input id="gid" inputmode="numeric" placeholder="gid узла"><button onclick="node()">Открыть узел</button></p>
+  <p><input id="question" size="50" placeholder="Вопрос агенту"><button onclick="ask()">Спросить</button></p>
+  <pre id="output"></pre>
+</main>
+<script>
+const out=document.getElementById('output');
+async function api(url, options){const r=await fetch(url,options);const d=await r.json();if(!r.ok)throw Error(d.detail||r.status);return d}
+async function load(){try{const d=await api('/api/graph');document.getElementById('stats').innerHTML=`<div class="stat">Узлов: ${d.nodes.length}</div><div class="stat">Связей: ${d.links.length}</div><div class="stat">Кластеров: ${d.clusters.length}</div>`;out.textContent=JSON.stringify(d.top,null,2)}catch(e){out.textContent=e}}
+async function node(){try{out.textContent=JSON.stringify(await api('/api/node/'+document.getElementById('gid').value),null,2)}catch(e){out.textContent=e}}
+async function ask(){try{out.textContent=JSON.stringify(await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:document.getElementById('question').value})}),null,2)}catch(e){out.textContent=e}}
+load();
+</script></body></html>
