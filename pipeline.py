@@ -142,7 +142,9 @@ def classify(df: pd.DataFrame) -> pd.DataFrame:
     values = df.apply(one, axis=1, result_type="expand")
     df[["role", "role_score", "evidence"]] = values
     def explain(r):
-        facts = f"Вход {r.sum_in:,.0f} KZT от {r.in_senders}; выход {r.sum_out:,.0f} KZT к {r.out_receivers}. "
+        money_in = f"{r.sum_in:,.0f}".replace(",", " ")
+        money_out = f"{r.sum_out:,.0f}".replace(",", " ")
+        facts = f"Вход {money_in} ₸; отправителей: {r.in_senders}. Выход {money_out} ₸; получателей: {r.out_receivers}. "
         reasons = {
             "distributor": f"Веер: {r.out_receivers} получателей при пороге 20.",
             "consolidator": f"Признаки консолидации: {r.in_senders} отправителей при пороге 8.",

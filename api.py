@@ -9,14 +9,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env", override=False, encoding="utf-8-sig")
 OUT = Path(os.getenv("GRAPH_OUT", str(BASE / "out")))
 FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", str(BASE / "frontend/dist")))
 app = FastAPI(title="Money Graph API")
 app.add_middleware(CORSMiddleware,
     allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:4174,http://127.0.0.1:4174").split(",") if x.strip()],
-    allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+    allow_methods=["GET", "POST"], allow_headers=["Content-Type"],
+    expose_headers=["X-Graph-Version"])
 
 def graph_data():
     p = OUT / "graph.json"
@@ -32,7 +35,7 @@ def graph():
 @app.get("/api/graph")
 def get_graph():
     data = graph_data()
-    version = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+    version = data.get("meta", {}).get("build_id") or hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
     return JSONResponse(data, headers={"Cache-Control": "no-store", "X-Graph-Version": version})
 
 @app.get("/api/health")

@@ -23,6 +23,9 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(len(members), cluster['n_nodes'])
         for node in self.data['nodes']:
             self.assertTrue(50 <= len(node['evidence']) <= 200)
+            self.assertIn('₸', node['evidence'])
+            self.assertNotIn('KZT', node['evidence'])
+            self.assertNotRegex(node['evidence'], r'\d,\d{3}')
             self.assertFalse(node['is_cutoff'] and node['role'] == 'terminal')
             self.assertFalse(node['is_seed'] and node['role'] in ('terminal', 'transit'))
 
